@@ -1,0 +1,10 @@
+# The build backend must travel with the sdist, because `pip install <sdist>`
+# imports it through `backend-path = ["."]`.  The staged kernel sources travel
+# too, as package data under python/mudnn/data, so an sdist needs neither the
+# `kernels/` tree nor the `3rdparty/mutlass` submodule to be installed.
+include build_backend.py
+
+# C++ headers.  They are package data of the `include` namespace package, which
+# setuptools does list in an sdist, but name them here as well so an sdist built
+# from a stripped tree cannot silently produce a header-less wheel.
+recursive-include include *

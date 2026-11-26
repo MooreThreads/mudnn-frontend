@@ -1,0 +1,15 @@
+# Python formatting follows the cuDNN frontend repository so that the MUSA
+# compatibility layer has the same review-time layout and line width.
+repos:
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.3.1
+    hooks:
+      - id: black
+        name: black
+        description: "Black: The uncompromising Python code formatter"
+        entry: black
+        language: python
+        minimum_pre_commit_version: 2.9.2
+        require_serial: true
+        types_or: [python, pyi]
+        args: ["--line-length", "160", "--fast"]

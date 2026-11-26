@@ -1,0 +1,330 @@
+{# Stand-alone K4: the chunk-parallel gradients of the chunked KDA backward. #}
+#include <musa_runtime.h>
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+#include <mutlass/kernel_hardware_info.hpp>
+
+#include <optional>
+
+{% if arch == "mp32" %}
+{% else %}
+#include "mate/flat/kda/chunk_kda_backward_grad.hpp"
+{% endif %}
+#include "mate/flat/kda/kernel/chunk_kda_initial_state_grad.hpp"
+
+#include "op_utils.hpp"
+
+{# Dedicated K4 backward-grad kernel.  Mirrors the K3 template's FFI conventions
+   so the two host-side launchers stay symmetric; the argument list differs only
+   where K4's inputs differ (it takes the K3 `dstate` pool instead of a
+   d_final_state seed and a d_initial_state output). #}
+namespace {
+
+namespace kda = mate::flat::kda;
+
+using Element          = {{ element }};
+using ElementGate = {{ gate_element }};
+using ElementBeta = {{ beta_element }};
+using CuSeqlensElement = {{ cu_seqlens_element }};
+
+using Collective = typename kda::ChunkKdaBackwardGrad{{ "Mp32" if arch == "mp32" else "" }}Builder<{{ arch_tag }},
+                                                             Element,
+                                                             CuSeqlensElement,
+                                                             {{ is_varlen }},
+                                                             {{ normalize_qk }},
+                                                             {{ chunk_size }},
+                                                             {{ head_dim }},
+                                                             {{ head_dim }}{% if arch == "mp32" %}, {{ reuse_prepare|default("false") }}{% endif %},
+                                                             ElementGate, ElementBeta, {{ use_beta_sigmoid }}, {{ allow_neg_eigval }},
+                                                             {{ safe_gate }}, {{ gate_is_log }}, {{ gate_is_linear }}>::Collective;
+using Params = typename Collective::Params;
+using Ws     = kda::ChunkKdaWorkspace<Element, {{ chunk_size }}, {{ head_dim }}>;
+
+static_assert(Collective::SharedStorageSize <= {{ max_dynamic_smem_bytes }},
+              "MP31 KDA K4 dynamic shared memory exceeds the device limit");
+
+{% if arch == "mp32" %}template<bool FastReciprocal>
+{% endif %}__global__ {% if arch == "mp32" %}__launch_bounds__(256, 5) {% endif %}void kda_backward_grad_kernel(Params params) {
+  extern __shared__ char smem_raw[];
+{% if arch == "mp32" %}
+  Collective{}.template run<FastReciprocal>(params, smem_raw);
+{% else %}
+  Collective{}(params, smem_raw);
+{% endif %}
+}
+
+{% if arch == "mp32" %}
+template<bool FastReciprocal>
+inline void launch_kda_backward_grad_impl(Params const& params, musaStream_t stream) {
+{% else %}
+inline void launch_kda_backward_grad(Params const& params, musaStream_t stream) {
+{% endif %}
+  dim3 grid = Collective::get_grid_shape(params);
+  if (grid.x == 0) {
+    return;
+  }
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
+      kda_backward_grad_kernel{% if arch == "mp32" %}<FastReciprocal>{% endif %}, musaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(Collective::SharedStorageSize)));
+  kda_backward_grad_kernel{% if arch == "mp32" %}<FastReciprocal>{% endif %}<<<grid, Collective::MaxThreadsPerBlock,
+                             Collective::SharedStorageSize, stream>>>(params);
+}
+
+{% if arch == "mp32" %}
+inline void launch_kda_backward_grad(Params const& params, musaStream_t stream) {
+  if constexpr (std::is_same_v<Element, mutlass::bfloat16_t> && Collective::kChunk == 16) {
+    // For C=16 and lower_bound >= -5, exp(sum(g)) >= exp(-80), safely normal in FP32.
+    if (Collective::SafeGate && params.lower_bound >= -5.f && params.lower_bound <= 0.f) {
+      launch_kda_backward_grad_impl<true>(params, stream);
+      return;
+    }
+  }
+  launch_kda_backward_grad_impl<false>(params, stream);
+}
+{% endif %}
+
+inline void check_last_dim_contiguous(ffi::TensorView x, const char* name) {
+  TVM_FFI_ICHECK_EQ(x.stride(x.ndim() - 1), 1) << name << " last dimension must be contiguous";
+}
+
+// THD activation tensor [B, T, H, 128] (or [1, S, H, 128] for varlen).
+inline void check_thd(ffi::TensorView x, DLDataType want, const char* name) {
+  CHECK_MUSA(x);
+  CHECK_DIM(4, x);
+  CHECK_INPUT_TYPE(x, want);
+  TVM_FFI_ICHECK_EQ(x.size(3), Collective::kHeadDim) << name << " must have head dim 128";
+  check_last_dim_contiguous(x, name);
+}
+
+}  // namespace
+
+void {{ func_name }}(ffi::TensorView q,
+                     ffi::TensorView k,
+                     ffi::TensorView v,
+                     ffi::TensorView g,
+                     ffi::TensorView beta,
+                     ffi::TensorView dO,
+                     ffi::TensorView dq,
+                     ffi::TensorView dk,
+                     ffi::TensorView dv,
+                     ffi::TensorView dg,
+                     ffi::TensorView dbeta,
+                     ffi::TensorView workspace_decayed,
+                     ffi::TensorView workspace_k_restored,
+                     ffi::TensorView workspace_inverse,
+                     ffi::TensorView workspace_p,
+                     ffi::TensorView workspace_total,
+                     ffi::TensorView chunk_states,
+                     ffi::TensorView dstate,
+                     {% if safe_gate == "true" %}ffi::TensorView{% else %}std::optional<ffi::TensorView>{% endif %} A_log,
+                     {% if safe_gate == "true" %}ffi::TensorView{% else %}std::optional<ffi::TensorView>{% endif %} dt_bias,
+                     double           scale,
+                     double           lower_bound,
+                     std::optional<ffi::TensorView> cu_seqlens{% if reuse_prepare|default("false") == "true" %},ffi::TensorView prepare_cache{% endif %}) {
+  check_{{ arch }}(q.device(), "{{ func_name }}");
+  check_thd(q, {{ element_dtype }}, "q");
+  check_thd(k, {{ element_dtype }}, "k");
+  check_thd(v, {{ element_dtype }}, "v");
+  check_thd(g, {{ gate_element_dtype }}, "g");
+  check_thd(dO, {{ element_dtype }}, "dO");
+  check_thd(dq, {{ element_dtype }}, "dq");
+  check_thd(dk, {{ element_dtype }}, "dk");
+  check_thd(dv, {{ element_dtype }}, "dv");
+  check_thd(dg, dl_float32, "dg");
+  CHECK_DEVICE(q, k); CHECK_DEVICE(q, v); CHECK_DEVICE(q, g); CHECK_DEVICE(q, dO);
+  CHECK_DEVICE(q, dq); CHECK_DEVICE(q, dk); CHECK_DEVICE(q, dv); CHECK_DEVICE(q, dg);
+  CHECK_SHAPE(q, k); CHECK_SHAPE(v, dO); CHECK_SHAPE(v, dq);
+  CHECK_SHAPE(v, dk); CHECK_SHAPE(v, dv); CHECK_SHAPE(v, dg);
+
+  CHECK_MUSA(beta);
+  CHECK_DIM(3, beta);
+  CHECK_CONTIGUOUS(beta);
+  CHECK_INPUT_TYPE(beta, {{ beta_element_dtype }});
+  CHECK_DEVICE(q, beta);
+  TVM_FFI_ICHECK_EQ(beta.size(2), v.size(2)) << "beta must have shape [B, T, Hv]";
+  TVM_FFI_ICHECK_EQ(beta.size(1), v.size(1)) << "beta must have shape [B, T, Hv]";
+
+  CHECK_MUSA(dbeta);
+  CHECK_DIM(3, dbeta);
+  CHECK_CONTIGUOUS(dbeta);
+  CHECK_INPUT_TYPE(dbeta, dl_float32);
+  CHECK_DEVICE(q, dbeta);
+  CHECK_SHAPE(dbeta, beta);
+
+{% if safe_gate == "true" %}
+  CHECK_MUSA(A_log);
+  CHECK_DIM(1, A_log);
+  CHECK_CONTIGUOUS(A_log);
+  CHECK_INPUT_TYPE(A_log, dl_float32);
+  CHECK_DEVICE(q, A_log);
+  TVM_FFI_ICHECK_EQ(A_log.size(0), v.size(2)) << "A_log must have shape [Hv]";
+  CHECK_MUSA(dt_bias);
+  CHECK_DIM(2, dt_bias);
+  CHECK_CONTIGUOUS(dt_bias);
+  CHECK_INPUT_TYPE(dt_bias, dl_float32);
+  CHECK_DEVICE(q, dt_bias);
+  TVM_FFI_ICHECK_EQ(dt_bias.size(0), v.size(2)) << "dt_bias must have shape [Hv, 128]";
+  TVM_FFI_ICHECK_EQ(dt_bias.size(1), Collective::kHeadDim) << "dt_bias must have shape [Hv, 128]";
+
+{% endif %}
+  // The five workspace views must be slices of ONE chunk-major record block.
+  auto check_workspace = [&](ffi::TensorView x, DLDataType dt, const char* name) {
+    CHECK_MUSA(x); CHECK_INPUT_TYPE(x, dt); CHECK_DEVICE(q, x);
+    TVM_FFI_ICHECK_EQ(x.stride(1), Ws::RecordStride)
+        << name << " must be a chunk-major workspace view";
+  };
+  check_workspace(workspace_decayed, {{ element_dtype }}, "workspace_decayed");
+  check_workspace(workspace_k_restored, {{ element_dtype }}, "workspace_k_restored");
+  check_workspace(workspace_inverse, {{ element_dtype }}, "workspace_inverse");
+  check_workspace(workspace_p, {{ element_dtype }}, "workspace_p");
+  check_workspace(workspace_total, {{ element_dtype }}, "workspace_total");
+
+  auto check_pool = [&](ffi::TensorView x, const char* name) {
+    CHECK_MUSA(x);
+    CHECK_DIM(4, x);
+    CHECK_CONTIGUOUS(x);
+    CHECK_INPUT_TYPE(x, {{ element_dtype }});
+    CHECK_DEVICE(q, x);
+    TVM_FFI_ICHECK_EQ(x.size(1), v.size(2)) << name << " must be [rows, Hv, Dv, D]";
+    TVM_FFI_ICHECK_EQ(x.size(2), Collective::kHeadDim) << name << " must be [rows, Hv, Dv, D]";
+    TVM_FFI_ICHECK_EQ(x.size(3), Collective::kHeadDim) << name << " must be [rows, Hv, Dv, D]";
+  };
+  check_pool(chunk_states, "chunk_states");
+  check_pool(dstate, "dstate");
+  TVM_FFI_ICHECK_EQ(dstate.size(0), chunk_states.size(0))
+      << "dstate and chunk_states must have the same row count";
+
+  int B = static_cast<int>(v.size(0));
+  int T = static_cast<int>(v.size(1));
+  int H = static_cast<int>(v.size(2));
+  TVM_FFI_ICHECK_GT(H, 0);
+
+  bool is_varlen = cu_seqlens.has_value();
+  TVM_FFI_ICHECK_EQ(is_varlen, {{ is_varlen }}) << "rendered KDA backward-grad varlen mode does not match inputs";
+  int N = B;
+  CuSeqlensElement const* cu_ptr = nullptr;
+  if (is_varlen) {
+    auto cu = cu_seqlens.value();
+    CHECK_MUSA(cu); CHECK_CONTIGUOUS(cu); CHECK_DIM(1, cu);
+    CHECK_INPUT_TYPE(cu, {{ cu_seqlens_dtype }});
+    CHECK_DEVICE(q, cu);
+    TVM_FFI_ICHECK_EQ(B, 1) << "B must be 1 when cu_seqlens is provided";
+    N = static_cast<int>(cu.size(0) - 1);
+    TVM_FFI_ICHECK_GT(N, 0);
+    cu_ptr = static_cast<CuSeqlensElement const*>(cu.data_ptr());
+  }
+
+  Params params{};
+  params.ptr_q = static_cast<Element const*>(q.data_ptr());
+  params.ptr_k = static_cast<Element const*>(k.data_ptr());
+  params.ptr_v = static_cast<Element const*>(v.data_ptr());
+  params.ptr_g = static_cast<ElementGate const*>(g.data_ptr());
+  params.ptr_beta = static_cast<ElementBeta const*>(beta.data_ptr());
+{% if safe_gate == "true" %}
+  params.ptr_A_log = static_cast<float const*>(A_log.data_ptr());
+  params.ptr_dt_bias = static_cast<float const*>(dt_bias.data_ptr());
+{% else %}
+  params.ptr_A_log=nullptr;
+  params.ptr_dt_bias=nullptr;
+{% endif %}
+  params.scale = static_cast<float>(scale);
+  params.lower_bound = static_cast<float>(lower_bound);
+  params.ptr_dO = static_cast<Element const*>(dO.data_ptr());
+{% if reuse_prepare|default("false") == "true" %}
+  CHECK_MUSA(prepare_cache);
+  CHECK_CONTIGUOUS(prepare_cache);
+  CHECK_DEVICE(q, prepare_cache);
+  CHECK_DIM(3, prepare_cache);
+  CHECK_INPUT_TYPE(prepare_cache, dl_float32);
+  TVM_FFI_ICHECK_EQ(prepare_cache.size(0),chunk_states.size(0));
+  TVM_FFI_ICHECK_EQ(prepare_cache.size(1),H);
+  TVM_FFI_ICHECK_EQ(prepare_cache.size(2),Collective::PrepareCacheLayout::RecordFloats);
+  params.ptr_prepare_cache=static_cast<float const*>(prepare_cache.data_ptr());
+{% endif %}
+  params.ptr_chunk_states = chunk_states.data_ptr();
+  params.ptr_dstate = dstate.data_ptr();
+  params.ptr_dq = static_cast<Element*>(dq.data_ptr());
+  params.ptr_dk = static_cast<Element*>(dk.data_ptr());
+  params.ptr_dv = static_cast<Element*>(dv.data_ptr());
+  params.ptr_dg = static_cast<float*>(dg.data_ptr());
+  params.ptr_dbeta = static_cast<float*>(dbeta.data_ptr());
+  params.ptr_ws_decayed = static_cast<Element const*>(workspace_decayed.data_ptr());
+  params.ptr_ws_k_restored = static_cast<Element const*>(workspace_k_restored.data_ptr()) +
+                             (Ws::KRestoredBackwardOffset - Ws::KRestoredOffset);
+  params.ptr_ws_p = static_cast<Element const*>(workspace_p.data_ptr()) +
+                    (Ws::PBackwardOffset - Ws::POffset);
+  params.ptr_ws_inverse = static_cast<Element const*>(workspace_inverse.data_ptr());
+  params.ptr_ws_total = static_cast<Element const*>(workspace_total.data_ptr());
+  params.stride_q1 = q.stride(1);
+  params.stride_q2 = q.stride(2);
+  params.stride_q3 = q.stride(0);
+  params.stride_v1 = v.stride(1);
+  params.stride_v2 = v.stride(2);
+  params.stride_v3 = v.stride(0);
+  params.nseq = N;
+  params.T = T;
+  params.H = H;
+  params.workspace_chunks = static_cast<int>((T + Collective::kChunk - 1) / Collective::kChunk);
+  params.cu_seqlens = cu_ptr;
+
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaStream_t stream = get_stream(q.device());
+  launch_kda_backward_grad(params, stream);
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
+
+void {{ func_name }}_initial_state(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView g, ffi::TensorView beta,
+    ffi::TensorView dO, ffi::TensorView dstate0,
+    std::optional<ffi::TensorView> d_final_state,
+    {% if safe_gate == "true" %}ffi::TensorView{% else %}std::optional<ffi::TensorView>{% endif %} A_log,
+    {% if safe_gate == "true" %}ffi::TensorView{% else %}std::optional<ffi::TensorView>{% endif %} dt_bias,
+    double scale, double lower_bound, std::optional<ffi::TensorView> cu_seqlens,
+    std::optional<ffi::TensorView> d_states) {
+  check_thd(q,{{ element_dtype }},"q");
+  check_thd(k,{{ element_dtype }},"k");
+  check_thd(g,{{ gate_element_dtype }},"g");
+  check_thd(dO,{{ element_dtype }},"dO");
+  CHECK_MUSA(beta);CHECK_DIM(3,beta);CHECK_INPUT_TYPE(beta,{{ beta_element_dtype }});
+  CHECK_MUSA(dstate0);CHECK_DIM(4,dstate0);CHECK_INPUT_TYPE(dstate0,dl_float32);
+  int H=int(q.size(2)),T=int(q.size(1));
+  int nseq=cu_seqlens.has_value() ? int(cu_seqlens->size(0))-1 : int(q.size(0));
+  TVM_FFI_ICHECK_EQ(dstate0.size(0),nseq);
+  TVM_FFI_ICHECK_EQ(dstate0.size(1),H);
+  TVM_FFI_ICHECK_EQ(dstate0.size(2),128);
+  TVM_FFI_ICHECK_EQ(dstate0.size(3),128);
+  Params p{};
+  p.ptr_q=static_cast<Element const*>(q.data_ptr());
+  p.ptr_k=static_cast<Element const*>(k.data_ptr());
+  p.ptr_g=static_cast<ElementGate const*>(g.data_ptr());
+  p.ptr_beta=static_cast<ElementBeta const*>(beta.data_ptr());
+  p.ptr_dO=static_cast<Element const*>(dO.data_ptr());
+  p.T=T;p.H=H;p.nseq=nseq;p.scale=float(scale);p.lower_bound=float(lower_bound);
+  p.cu_seqlens=cu_seqlens.has_value() ? static_cast<CuSeqlensElement const*>(cu_seqlens->data_ptr()) : nullptr;
+{% if safe_gate == "true" %}
+  CHECK_MUSA(A_log);CHECK_INPUT_TYPE(A_log,dl_float32);
+  CHECK_MUSA(dt_bias);CHECK_INPUT_TYPE(dt_bias,dl_float32);
+  p.ptr_A_log=static_cast<float const*>(A_log.data_ptr());
+  p.ptr_dt_bias=static_cast<float const*>(dt_bias.data_ptr());
+{% endif %}
+  if(d_final_state.has_value()) {
+    auto dfs=*d_final_state;
+    CHECK_MUSA(dfs);CHECK_INPUT_TYPE(dfs,dl_float32);
+    TVM_FFI_ICHECK_EQ(d_final_state->numel(),dstate0.numel());
+  }
+  if(d_states.has_value()) {
+    auto ds=*d_states;CHECK_MUSA(ds);CHECK_DIM(4,ds);CHECK_INPUT_TYPE(ds,{{ element_dtype }});
+  }
+  if(nseq==0) return;
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaStream_t stream=get_stream(q.device());
+  mate::flat::kda::chunk_kda_initial_state_grad_kernel<Collective>
+      <<<nseq*H*(128/4),128,0,stream>>>(
+          p,static_cast<float*>(dstate0.data_ptr()),
+          d_final_state.has_value() ? static_cast<float const*>(d_final_state->data_ptr()) : nullptr,
+          d_states.has_value() ? static_cast<Element*>(d_states->data_ptr()) : nullptr);
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_initial_state,{{ func_name }}_initial_state);

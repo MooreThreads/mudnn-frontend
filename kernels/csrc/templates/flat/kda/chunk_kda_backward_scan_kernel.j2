@@ -1,0 +1,258 @@
+#include <musa_runtime.h>
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+
+#include <optional>
+
+#include "mate/flat/kda/chunk_kda_backward_scan.hpp"
+#include "op_utils.hpp"
+
+{# K3: the reverse chunk scan.  It consumes K1's five workspace fields, dO and
+   the optional d_final_state seed, and publishes the per-chunk `dstate` pool
+   (the INCOMING dS of every chunk) plus `dstate0`. #}
+namespace {
+
+namespace kda = mate::flat::kda;
+
+using Element = {{ element }};
+using CuSeqlensElement = {{ cu_seqlens_element }};
+using LogicalShape = kda::ChunkKdaLogicalShape<{{ chunk_size }}, {{ head_dim }}, {{ head_dim }}>;
+using Kernel = typename kda::ChunkKdaBackwardScanBuilder<{{ arch_tag }},
+                                                         Element,
+                                                         CuSeqlensElement,
+                                                         LogicalShape,
+                                                         {{ is_varlen }}>::Kernel;
+using CollectiveScan = typename Kernel::CollectiveScan;
+
+static constexpr int kChunk    = CollectiveScan::C;
+static constexpr int kHeadDim  = CollectiveScan::D;
+static constexpr int kValueDim = CollectiveScan::V;
+static constexpr int kThreads  = CollectiveScan::MaxThreadsPerBlock;
+
+static_assert(decltype(mute::size(typename CollectiveScan::TiledMmaCV{}))::value == kThreads &&
+                  decltype(mute::size(typename CollectiveScan::TiledMmaVK{}))::value == kThreads,
+              "K3 drives every SQMMA from one 128-thread warp squad");
+static_assert(kChunk == 16 && kHeadDim == 128 && kValueDim == 128,
+              "the MP31 K3 scan is fixed at C=16, D=V=128");
+static_assert(Kernel::SharedStorageSize <= {{ max_dynamic_smem_bytes }},
+              "K3 shared memory exceeds the dynamic-smem ceiling");
+
+void launch_chunk_kda_backward_scan(Element const* dO,
+                                    float const*   d_final_state,
+                                    void*          dstate,
+                                    float*         dstate0,
+                                    Element const* workspace_decayed,
+                                    Element const* workspace_k_restored,
+                                    Element const* workspace_p,
+                                    Element const* workspace_inverse,
+                                    Element const* workspace_total,
+                                    CuSeqlensElement const* cu_seqlens,
+                                    int64_t        stride_o1,
+                                    int64_t        stride_o2,
+                                    int64_t        stride_o3,
+                                    int            N,
+                                    int            T,
+                                    int            H,
+                                    int            workspace_chunks,
+                                    musaStream_t   stream) {
+  typename Kernel::Arguments arguments{
+      typename CollectiveScan::Arguments{
+          dO,
+          d_final_state,
+          dstate,
+          dstate0,
+          workspace_decayed,
+          workspace_k_restored,
+          workspace_p,
+          workspace_inverse,
+          workspace_total,
+          stride_o1,
+          stride_o2,
+          stride_o3,
+          N,
+          T,
+          H,
+          workspace_chunks,
+          {% if is_varlen == "true" %}cu_seqlens{% else %}nullptr{% endif %},
+      },
+  };
+
+  typename Kernel::Params params = Kernel::to_underlying_arguments(arguments);
+  dim3                    grid   = Kernel::get_grid_shape(params);
+  if (grid.x == 0) {
+    return;
+  }
+  auto kernel = mutlass::device_kernel<Kernel>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
+      kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
+  kernel<<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+}
+
+inline void check_last_dim_contiguous(ffi::TensorView x, const char* name) {
+  TVM_FFI_ICHECK_EQ(x.stride(x.ndim() - 1), 1) << name << " last dimension must be contiguous";
+}
+
+// Every workspace field is a view into ONE chunk-major allocation, so the
+// views are deliberately NOT contiguous: validate the record stride instead.
+inline void check_workspace_field(ffi::TensorView x, DLDataType dtype, const char* name,
+                                  ffi::TensorView ref, int64_t rows, int64_t cols) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, dtype); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 4) << name << " must be [records, heads, rows, cols]";
+  TVM_FFI_ICHECK_EQ(x.size(2), rows) << name << " has an unexpected row count";
+  TVM_FFI_ICHECK_EQ(x.size(3), cols) << name << " has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(3), 1) << name << " inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(2), cols) << name << " rows must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), CollectiveScan::Workspace::RecordStride)
+      << name << " must be a chunk-major workspace view";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * CollectiveScan::Workspace::RecordStride)
+      << name << " outer dimension must stride by heads * chunk-major record stride";
+}
+
+inline void check_workspace_total(ffi::TensorView x, ffi::TensorView ref) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, {{ element_dtype }}); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_EQ(x.ndim(), 3) << "workspace_total must be [records, heads, kHeadDim]";
+  TVM_FFI_ICHECK_EQ(x.size(2), kHeadDim) << "workspace_total has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(2), 1) << "workspace_total inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), CollectiveScan::Workspace::RecordStride)
+      << "workspace_total must use the chunk-major record stride";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * CollectiveScan::Workspace::RecordStride)
+      << "workspace_total outer dimension must stride by heads * record stride";
+}
+
+inline void check_workspace_offsets(ffi::TensorView decayed, ffi::TensorView k_restored,
+                                    ffi::TensorView inverse, ffi::TensorView p, ffi::TensorView total) {
+  const char*   base = static_cast<const char*>(decayed.data_ptr());
+  const int64_t esz  = static_cast<int64_t>(sizeof(Element));
+  auto at = [&](ffi::TensorView x, int64_t off_bytes, const char* name) {
+    TVM_FFI_ICHECK_EQ(static_cast<const char*>(x.data_ptr()) - base, off_bytes)
+        << name << " must alias the chunk-major workspace at byte offset " << off_bytes;
+  };
+  at(k_restored, CollectiveScan::Workspace::KRestoredOffset * esz, "workspace_k_restored");
+  at(inverse, CollectiveScan::Workspace::InverseOffset * esz, "workspace_inverse");
+  at(p, CollectiveScan::Workspace::POffset * esz, "workspace_p");
+  at(total, CollectiveScan::Workspace::TotalOffsetBytes, "workspace_total");
+}
+
+}  // namespace
+
+void {{ func_name }}(ffi::TensorView                dO,
+                     ffi::TensorView                workspace_decayed,
+                     ffi::TensorView                workspace_k_restored,
+                     ffi::TensorView                workspace_inverse,
+                     ffi::TensorView                workspace_p,
+                     ffi::TensorView                workspace_total,
+                     ffi::TensorView                dstate,
+                     ffi::TensorView                dstate0,
+                     std::optional<ffi::TensorView> d_final_state,
+                     std::optional<ffi::TensorView> cu_seqlens) {
+  check_mp31(dO.device(), "{{ func_name }}");
+  CHECK_MUSA(dO);
+  CHECK_DIM(4, dO);
+  CHECK_INPUT_TYPE(dO, {{ element_dtype }});
+  check_last_dim_contiguous(dO, "dO");
+  TVM_FFI_ICHECK_EQ(dO.size(3), kValueDim) << "dO last dimension must be " << kValueDim;
+
+  check_workspace_field(workspace_decayed, {{ element_dtype }}, "workspace_decayed", dO,
+                        2 * kChunk, kHeadDim);
+  check_workspace_field(workspace_k_restored, {{ element_dtype }}, "workspace_k_restored", dO,
+                        kChunk, kHeadDim);
+  check_workspace_field(workspace_inverse, {{ element_dtype }}, "workspace_inverse", dO,
+                        kChunk, kChunk);
+  check_workspace_field(workspace_p, {{ element_dtype }}, "workspace_p", dO, kChunk, kChunk);
+  check_workspace_total(workspace_total, dO);
+  check_workspace_offsets(workspace_decayed, workspace_k_restored, workspace_inverse,
+                          workspace_p, workspace_total);
+
+  int B = static_cast<int>(dO.size(0));
+  int T = static_cast<int>(dO.size(1));
+  int H = static_cast<int>(dO.size(2));
+  TVM_FFI_ICHECK_GT(H, 0);
+
+  bool is_varlen = cu_seqlens.has_value();
+  TVM_FFI_ICHECK_EQ(is_varlen, {{ is_varlen }}) << "rendered KDA K3 varlen mode does not match inputs";
+  int                    N       = B;
+  CuSeqlensElement const* cu_ptr = nullptr;
+  if (is_varlen) {
+    auto cu = cu_seqlens.value();
+    CHECK_MUSA(cu);
+    CHECK_CONTIGUOUS(cu);
+    CHECK_DIM(1, cu);
+    CHECK_INPUT_TYPE(cu, {{ cu_seqlens_dtype }});
+    CHECK_DEVICE(dO, cu);
+    TVM_FFI_ICHECK_EQ(B, 1) << "B must be 1 when cu_seqlens is provided";
+    N = static_cast<int>(cu.size(0) - 1);
+    TVM_FFI_ICHECK_GT(N, 0);
+    cu_ptr = static_cast<CuSeqlensElement const*>(cu.data_ptr());
+  }
+
+  // Caller-owned [rows, H, V, D] pool of the INCOMING dS per chunk, in K2's
+  // chunk-state row space so K4 can read a row as a [V, D] matrix.
+  CHECK_MUSA(dstate);
+  CHECK_DIM(4, dstate);
+  CHECK_CONTIGUOUS(dstate);
+  CHECK_DEVICE(dO, dstate);
+  CHECK_INPUT_TYPE(dstate, {{ element_dtype }});
+  TVM_FFI_ICHECK_EQ(dstate.size(1), H) << "dstate must be [rows, H, " << kValueDim << ", " << kHeadDim << "]";
+  TVM_FFI_ICHECK_EQ(dstate.size(2), kValueDim) << "dstate value dimension";
+  TVM_FFI_ICHECK_EQ(dstate.size(3), kHeadDim) << "dstate head dimension";
+  int64_t rows_needed = is_varlen ? int64_t(mutlass::ceil_div(T, kChunk)) + N
+                                  : int64_t(B) * mutlass::ceil_div(T, kChunk);
+  TVM_FFI_ICHECK_GE(dstate.size(0), rows_needed) << "dstate needs at least " << rows_needed << " rows";
+
+  CHECK_MUSA(dstate0);
+  CHECK_DIM(4, dstate0);
+  CHECK_CONTIGUOUS(dstate0);
+  CHECK_DEVICE(dO, dstate0);
+  CHECK_INPUT_TYPE(dstate0, dl_float32);
+  TVM_FFI_ICHECK_EQ(dstate0.size(0), N) << "dstate0 must be [N, H, V, D]";
+  TVM_FFI_ICHECK_EQ(dstate0.size(1), H) << "dstate0 must be [N, H, V, D]";
+  TVM_FFI_ICHECK_EQ(dstate0.size(2), kValueDim) << "dstate0 must be [N, H, V, D]";
+  TVM_FFI_ICHECK_EQ(dstate0.size(3), kHeadDim) << "dstate0 must be [N, H, V, D]";
+
+  float const* d_final_ptr = nullptr;
+  if (d_final_state.has_value()) {
+    auto s = d_final_state.value();
+    CHECK_MUSA(s);
+    CHECK_DIM(4, s);
+    CHECK_CONTIGUOUS(s);
+    CHECK_DEVICE(dO, s);
+    CHECK_INPUT_TYPE(s, dl_float32);
+    TVM_FFI_ICHECK_EQ(s.size(0), N) << "d_final_state must be [N, H, V, D]";
+    TVM_FFI_ICHECK_EQ(s.size(1), H) << "d_final_state must be [N, H, V, D]";
+    TVM_FFI_ICHECK_EQ(s.size(2), kValueDim) << "d_final_state must be [N, H, V, D]";
+    TVM_FFI_ICHECK_EQ(s.size(3), kHeadDim) << "d_final_state must be [N, H, V, D]";
+    d_final_ptr = static_cast<float const*>(s.data_ptr());
+  }
+
+  ffi::MUSADeviceGuard device_guard(dO.device().device_id);
+  musaStream_t         stream = get_stream(dO.device());
+
+  int64_t const stride_o1 = dO.stride(1);
+  int64_t const stride_o2 = dO.stride(2);
+  int64_t const stride_o3 = dO.stride(0);
+  int           workspace_chunks = static_cast<int>(mutlass::ceil_div(T, kChunk));
+
+  launch_chunk_kda_backward_scan(static_cast<Element const*>(dO.data_ptr()),
+                                 d_final_ptr,
+                                 dstate.data_ptr(),
+                                 static_cast<float*>(dstate0.data_ptr()),
+                                 static_cast<Element const*>(workspace_decayed.data_ptr()),
+                                 static_cast<Element const*>(workspace_k_restored.data_ptr()),
+                                 static_cast<Element const*>(workspace_p.data_ptr()),
+                                 static_cast<Element const*>(workspace_inverse.data_ptr()),
+                                 static_cast<Element const*>(workspace_total.data_ptr()),
+                                 cu_ptr,
+                                 stride_o1,
+                                 stride_o2,
+                                 stride_o3,
+                                 N,
+                                 T,
+                                 H,
+                                 workspace_chunks,
+                                 stream);
+
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

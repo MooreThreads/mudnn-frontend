@@ -1,0 +1,65 @@
+#pragma once
+
+#include "oss_engine_interface.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace mudnn_frontend {
+namespace experimental {
+
+inline const KernelSpec* lookup_sm100_kernel_spec(int, int) { return nullptr; }
+
+class Sm100SdpaPrefillEngine : public IOssSdpaEngine {
+ public:
+  Sm100SdpaPrefillEngine() = default;
+  ~Sm100SdpaPrefillEngine() override = default;
+
+  Sm100SdpaPrefillEngine(const Sm100SdpaPrefillEngine&) = delete;
+  Sm100SdpaPrefillEngine& operator=(const Sm100SdpaPrefillEngine&) = delete;
+  Sm100SdpaPrefillEngine(Sm100SdpaPrefillEngine&&) noexcept = default;
+  Sm100SdpaPrefillEngine& operator=(Sm100SdpaPrefillEngine&&) noexcept =
+      default;
+
+  error_t check_support(AttentionShape_t shape, int sm_version) override {
+    return unsupported("SM100 OSS SDPA prefill engine", shape.d_qk, sm_version);
+  }
+
+  static int64_t get_workspace_size() {
+    return IOssSdpaEngine::get_workspace_size();
+  }
+
+  error_t build() override {
+    return {false,
+            "SM100 OSS SDPA prefill engine is not supported by muDNN frontend",
+            error_code_t::NOT_SUPPORTED};
+  }
+
+  error_t execute(int, int, int, int, int, int, void*,
+                  const std::vector<int64_t>&, void*,
+                  const std::vector<int64_t>&, void*,
+                  const std::vector<int64_t>&, void*,
+                  const std::vector<int64_t>&, void*,
+                  const std::vector<int64_t>&, void*,
+                  const std::vector<int64_t>&, void*, int, CompatCudaStream_t,
+                  std::optional<float> = std::nullopt) override {
+    return {false,
+            "SM100 OSS SDPA prefill engine execution is not supported by "
+            "muDNN frontend",
+            error_code_t::NOT_SUPPORTED};
+  }
+
+ private:
+  static error_t unsupported(const char* engine, uint32_t d, int sm_version) {
+    return {false,
+            std::string(engine) +
+                " is not available in muDNN frontend (d=" + std::to_string(d) +
+                ", sm_version=" + std::to_string(sm_version) + ")",
+            error_code_t::GRAPH_NOT_SUPPORTED};
+  }
+};
+
+}  // namespace experimental
+}  // namespace mudnn_frontend
